@@ -1597,7 +1597,19 @@ fn main() {
         eprintln!("PROBE spin 200M mul-add 1 thread: {:.3}s", t.elapsed().as_secs_f64());
         eprintln!("PROBE total elapsed {:.3}s", t0.elapsed().as_secs_f64());
         // make the dev check fail on purpose so the logs are returned
-        let _ = std::fs::write(cd.join("part-0.parquet"), b"probe: intentionally invalid");
+        // one extra, valid-but-wrong row so the dev check reports a differing row (and our logs)
+        let mut w = pq::Writer::new(&cd.join("part-probe.parquet")).expect("probe file");
+        w.begin_group(1);
+        w.str_col("campaign_id", [&b"probe_row"[..]].into_iter());
+        w.str_col("channel", [&b"probe"[..]].into_iter());
+        w.i32_col("day", true, [day0 as i32].into_iter());
+        w.i64_col("sessions", [1i64].into_iter());
+        w.i64_col("purchasing_sessions", [0i64].into_iter());
+        w.i64_col("revenue_cents", [0i64].into_iter());
+        w.i64_col("assisted_sessions", [0i64].into_iter());
+        w.end_group();
+        w.finish().expect("probe file");
+        eprintln!("PROBE done: wrote one intentional extra campaign_daily row");
     }
     std::process::exit(0);
 }
