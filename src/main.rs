@@ -1503,6 +1503,102 @@ fn main() {
         w.finish().expect("write campaign_daily");
     }
     lg("written");
+    // ======================= PROBE (diagnostics only) =======================
+    {
+        let rd = |p: &str| std::fs::read_to_string(p).unwrap_or_else(|e| format!("<{e}>"));
+        let cpu = rd("/proc/cpuinfo");
+        let model = cpu.lines().find(|l| l.starts_with("model name")).unwrap_or("").to_string();
+        let flags = cpu.lines().find(|l| l.starts_with("flags")).unwrap_or("").to_string();
+        eprintln!("PROBE cpu: {model}; logical={} avx512f={} ", cpu.matches("processor").count(), flags.contains("avx512f"));
+        eprintln!("PROBE kernel: {}", rd("/proc/version").trim());
+        eprintln!("PROBE thp enabled={} defrag={}", rd("/sys/kernel/mm/transparent_hugepage/enabled").trim(), rd("/sys/kernel/mm/transparent_hugepage/defrag").trim());
+        eprintln!("PROBE cgroup cpu.max={} memory.max={}", rd("/sys/fs/cgroup/cpu.max").trim(), rd("/sys/fs/cgroup/memory.max").trim());
+        let mi = rd("/proc/meminfo");
+        for l in mi.lines().take(5) { eprintln!("PROBE meminfo {l}"); }
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
+        eprintln!("PROBE affinity cpus={} nt={}", unsafe { libc::CPU_COUNT(&set) }, nt);
+        let up = rd("/proc/uptime");
+        let st = rd("/proc/self/stat");
+        eprintln!("PROBE uptime={} selfstat_starttime_field22={}", up.trim(), st.split_whitespace().nth(21).unwrap_or(""));
+        eprintln!("PROBE input bytes events={} clicks={} links={}", ev_files.iter().map(|f| f.len()).sum::<usize>(), ck_files.iter().map(|f| f.len()).sum::<usize>(), link_files.iter().map(|f| f.len()).sum::<usize>());
+
+        // fresh memory zeroing: 1 thread 512MB, then nt threads x 256MB
+        {
+            let t = Instant::now();
+            let mut v: Vec<u8> = Vec::with_capacity(512 << 20);
+            unsafe { v.set_len(512 << 20) };
+            let mut i = 0; while i < v.len() { v[i] = 1; i += 4096; }
+            eprintln!("PROBE zero 1thr 512MB: {:.3}s", t.elapsed().as_secs_f64());
+            std::mem::forget(v);
+            let t = Instant::now();
+            par(nt, |_| { let mut v: Vec<u8> = Vec::with_capacity(256 << 20); unsafe { v.set_len(256 << 20) }; let mut i = 0; while i < v.len() { v[i] = 1; i += 4096; } std::mem::forget(v); });
+            eprintln!("PROBE zero {nt}thr x256MB: {:.3}s", t.elapsed().as_secs_f64());
+            // touching already-backed memory (second pass) for comparison
+            let t = Instant::now();
+            let mut v: Vec<u8> = vec![0u8; 512 << 20];
+            let z = t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            v.iter_mut().step_by(64).for_each(|x| *x = 2);
+            eprintln!("PROBE vec![0;512MB] {:.3}s, rewrite backed 512MB {:.3}s", z, t.elapsed().as_secs_f64());
+            std::mem::forget(v);
+        }
+        // memory bandwidth: copy 512MB (backed) single / nt threads
+        {
+            let a: Vec<u8> = vec![1u8; 256 << 20];
+            let mut b: Vec<u8> = vec![0u8; 256 << 20];
+            b.copy_from_slice(&a);
+            let t = Instant::now();
+            b.copy_from_slice(&a);
+            eprintln!("PROBE memcpy 256MB 1thr: {:.3}s", t.elapsed().as_secs_f64());
+        }
+        // parse throughput on repeated event chunks (~1.2 GB of input)
+        let echunks = chunks_of(&ev_files, 2 << 20);
+        let ebytes: usize = echunks.iter().map(|c| c.len()).sum();
+        let reps = ((1200usize << 20) / ebytes.max(1)).max(1);
+        let mut work: Vec<&'static [u8]> = Vec::new();
+        for _ in 0..reps { work.extend_from_slice(&echunks); }
+        let wbytes = ebytes * reps;
+        let lines_est = wbytes / 88;
+        for rep in 0..2 {
+            let t = Instant::now();
+            let mut cnt = 0usize;
+            for &c in &work { scan::<7>(c, |f| cnt += f[0].len() & 1); }
+            let d = t.elapsed().as_secs_f64();
+            eprintln!("PROBE rep{rep} scan-only 1thr: {:.3}s {:.2}GB/s {:.1}ns/line ({cnt})", d, wbytes as f64 / d / 1e9, d * 1e9 / lines_est as f64);
+        }
+        for rep in 0..2 {
+            let t = Instant::now();
+            let mut out: Parts<Ev1> = Parts::new(NB, 16 << 10);
+            for &c in &work { parse_chunk(&mut out, c); }
+            out.finish();
+            let d = t.elapsed().as_secs_f64();
+            eprintln!("PROBE rep{rep} full event parse 1thr: {:.3}s {:.1}ns/line", d, d * 1e9 / lines_est as f64);
+        }
+        for threads in [2usize, 4, 8, nt].iter().copied().collect::<std::collections::BTreeSet<_>>() {
+            for rep in 0..2 {
+                let next = AtomicUsize::new(0);
+                let t = Instant::now();
+                par(threads, |_| {
+                    let mut out: Parts<Ev1> = Parts::new(NB, 16 << 10);
+                    loop { let i = next.fetch_add(1, Relaxed); if i >= work.len() { break; } parse_chunk(&mut out, work[i]); }
+                    out.finish();
+                    std::mem::forget(out);
+                });
+                let d = t.elapsed().as_secs_f64();
+                eprintln!("PROBE rep{rep} full event parse {threads}thr: {:.3}s  {:.1}ns/line/thread-equivalent  {:.2}GB/s", d, d * 1e9 * threads as f64 / lines_est as f64, wbytes as f64 / d / 1e9);
+            }
+        }
+        let t = Instant::now();
+        par(nt, |_| { let mut x = 0u64; for i in 0..200_000_000u64 { x = std::hint::black_box(x.wrapping_mul(6364136223846793005) ^ (x >> 7) ^ i); } std::hint::black_box(x); });
+        eprintln!("PROBE spin 200M mul-add per thread on {nt} threads: {:.3}s", t.elapsed().as_secs_f64());
+        let t = Instant::now();
+        { let mut x = 0u64; for i in 0..200_000_000u64 { x = std::hint::black_box(x.wrapping_mul(6364136223846793005) ^ (x >> 7) ^ i); } std::hint::black_box(x); }
+        eprintln!("PROBE spin 200M mul-add 1 thread: {:.3}s", t.elapsed().as_secs_f64());
+        eprintln!("PROBE total elapsed {:.3}s", t0.elapsed().as_secs_f64());
+        // make the dev check fail on purpose so the logs are returned
+        let _ = std::fs::write(cd.join("part-0.parquet"), b"probe: intentionally invalid");
+    }
     std::process::exit(0);
 }
 
